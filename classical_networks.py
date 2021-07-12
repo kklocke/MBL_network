@@ -52,7 +52,8 @@ def bathDensity(energies, tau):
         for the links, return the weighted links.
     """
     # return (tau / 2.) * np.exp(-tau * np.abs(energies)) # exponential bath
-    return tau * np.exp(- (energies * tau)**2 / 2.) / np.sqrt(2. * np.pi)
+    # return tau * np.exp(- (energies * tau)**2 / 2.) / np.sqrt(2. * np.pi) # Gaussian bath
+    return (2. / np.sqrt(np.pi)) * tau / (1. + (energies * tau)**2)
 
 class Network:
     """
@@ -127,7 +128,7 @@ class Network:
         """
 
         # Calculate the link weight 2*pi * |V_{jl}|^2 * \rho(\tau, energy diff)
-        link_weights = np.abs(self.links)**2 * 2. * np.pi * bathDensity(self.link_energies, self.tau)
+        link_weights = np.abs(self.links)**2 * bathDensity(self.link_energies, self.tau)
         # Calculate the escape rates \Gamma_j = \sum_l w_{jl} (1 - n_l)
         escape_rates = self.nodes * np.array([np.dot((1 - self.nodes), link_weights[j,:]) for j in range(N)])
         # escape_rates = np.sum(np.array([[ (1 - self.nodes[l]) * link_weights[j,l] for j in range(self.N)] for l in range(self.N)]),axis=1)
