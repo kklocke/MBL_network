@@ -1,9 +1,10 @@
 import numpy as np
 import sys
+from numba import jit, vectorize
 
-from collections import defaultdict
 from time import time
 
+@jit
 def generateRealization(N,h,myDis=[]):
     """
         Given a system size (N) and disorder strength (h), generate a disorder
@@ -15,10 +16,6 @@ def generateRealization(N,h,myDis=[]):
             to use.
     """
 
-    # Specify the disorder profile
-    if len(myDis) != N:
-        myDis = h * (2 * np.random.rand(N) - 1)
-
     # Compute the single particle energies and the orbitals
     myMat = -np.diag(myDis)
     myMat += np.diag(0.5 * np.ones(N - 1), 1)
@@ -28,7 +25,7 @@ def generateRealization(N,h,myDis=[]):
 
     # Compute the matrix elements U_{ij} for density-density interaction
     psi = vecs
-    psi_roll = np.roll(vecs, axis=1, shift=1)
+    psi_roll = np.array([[vecs[j,(i-1)%N] for i in range(N)] for j in range(N)])
     psi_prod_diff = np.array([[[psi[l,n]*psi_roll[l,m] - psi[l,m]*psi_roll[l,n] for l in range(N)] for n in range(N)] for m in range(N)])
     Us = np.sum(np.conj(psi_prod_diff) * psi_prod_diff,axis=0)
     # Vs = np.sum(np.conj(psi_prod_diff[:,j,k]) * psi_prod_diff[:,k,n],axis=0)
@@ -45,133 +42,133 @@ def genRandConfig(N,partNum=1):
     np.random.shuffle(node)
     return node
 
+@vectorize
 def bathDensity(energies, tau):
     """
-        TODO: Specify a bath
         Given an inverse energy window (tau) and energy differences (energies)
         for the links, return the weighted links.
     """
-    # return (tau / 2.) * np.exp(-tau * np.abs(energies)) # exponential bath
-    # return tau * np.exp(- (energies * tau)**2 / 2.) / np.sqrt(2. * np.pi) # Gaussian bath
     return (2. / np.sqrt(np.pi)) * tau / (1. + (energies * tau)**2)
 
-class Network:
+
+def run_sim(N, h, myDis = [], partNum = -1, tau = 1., N_steps = 100):
     """
-        Network class ...
+        Initialize a network with N sites and disorder strength h.
+
+        Optional parameters:
+            - myDis -- an array of length N which specifies the disorder realization.
+            - partNum -- the number of fermions in the system.
+            - tau -- the inverse energy window
+            - N_steps -- number of update steps
     """
-    def __init__(self, N, h, myDis = [], partNum = -1, tau = 1.):
-        """
-            Initialize a network with N sites and disorder strength h.
+    if partNum < 0:
+        partNum = N // 2
+    if len(myDis) != N:
+        myDis = np.random.uniform(low = -h, high = +h, size = N)
 
-            Optional parameters:
-                - myDis -- an array of length N which specifies the disorder realization.
-                - partNum -- the number of fermions in the system.
-                - tau -- the inverse energy window
-        """
-        self.N = N
-        self.h = h
-        self.tau = tau
+    (ep,Us,Vs) = generateRealization(N, h, myDis = myDis)
+    for i in range(N):
+        Us[i,i] = 0
+        Vs[:,i,i] *= 0
+        Vs[i,:,i] *= 0
+        Vs[i,i,:] *= 0
 
-        if partNum < 0:
-            self.partNum = self.N // 2
-        else:
-            self.partNum = partNum
+    myH = np.diag(ep) + Us
+    nodes = genRandConfig(N, partNum = partNum)
+    energy = np.dot(np.dot(1. * nodes, myH), 1. * nodes)
 
-        if len(myDis) == 0:
-            self.dis = np.random.uniform(low = -self.h, high = self.h, size = N)
-        else:
-            self.dis = myDis
+    print("Initial node config: ", ''.join([str(int(elem)) for elem in nodes]))
 
-        # Generate the Anderson orbital representation
-        (ep,Us,Vs) = generateRealization(self.N, self.h, myDis = self.dis)
-        self.ep = ep
-        self.Us = Us
-        self.Vs = Vs
+    links = np.einsum('jkl,k', Vs, 1.*nodes)
+    links -= np.diag(np.diag(links))
 
-        # Enforce which matrix elements ought to be zero in case of
-        # some rounding error.
-        for i in range(self.N):
-            self.Us[i,i] = 0
-            self.Vs[:,i,i] *= 0
-            self.Vs[i,:,i] *= 0
-            self.Vs[i,i,:] *= 0
+    dt = 0
+    current = 0
+    myTime = 0
 
-        # Initialize the Hamiltonian, node configuration, and energy
-        self.Hamiltonian = np.diag(self.ep) + self.Us
-        self.nodes = genRandConfig(self.N, partNum = self.partNum)
-        print("Initial node config: " + ''.join([str(elem) for elem in self.nodes]))
-        self.energy = np.dot(np.dot(self.nodes, self.Hamiltonian), self.nodes)
+    link_energies = np.zeros((N,N))
+    interact_energies = np.einsum('jk,k',Us,1.*nodes)
+    for j in range(N):
+        for l in range(N):
+            link_energies[j,l] -= (ep[j] - ep[l])
+            link_energies[j,l] -= (interact_energies[j] - interact_energies[l])
 
-        # Initialize the links V_{jl} = \sum_k V_{jl}^{(k)} n_k
-        self.links = np.einsum('jkl,k', self.Vs, self.nodes)
-        self.links -= np.diag(np.diag(self.links)) # Avoid possible errors
+    ## Initialization over -- now run updating scheme
+    node_history = ["" for _ in range(N_steps)]
+    energy_history = np.zeros(N_steps)
+    time_history = np.zeros(N_steps)
+    occAvg = np.zeros(N)
 
-        self.current = 0
-        self.dt = 0
-        self.time = 0
 
-        # Calculate the energy differences associated with
-        # moving a particle from site j to site l.
-        self.link_energies = np.zeros((self.N, self.N))
-        interact_energies = np.einsum('jk,k', self.Us, self.nodes)
-        for j in range(N):
-            for l in range(N):
-                self.link_energies[j,l] -= self.ep[j] - self.ep[l]
-                self.link_energies[j,l] -= interact_energies[j] - interact_energies[l]
+    for i in range(N_steps):
+        if i % (N_steps // 20) == 0:
+            print(i)
+        energy_history[i] = energy
+        time_history[i] = myTime
+        node_history[i] = ''.join([str(int(elem)) for elem in nodes])
 
-    def update(self):
-        """
-            Update scheme for the Monte Carlo.
-            (1) Compute the escape rates for each particle
-            (2) Randomly select a particle to escape and choose which link it takes.
-            (3) Update the stored link weights and such.
-        """
+        old_nodes = np.copy(nodes)
 
-        # Calculate the link weight 2*pi * |V_{jl}|^2 * \rho(\tau, energy diff)
-        link_weights = np.abs(self.links)**2 * bathDensity(self.link_energies, self.tau)
-        # Calculate the escape rates \Gamma_j = \sum_l w_{jl} (1 - n_l)
-        escape_rates = self.nodes * np.array([np.dot((1 - self.nodes), link_weights[j,:]) for j in range(N)])
-        # escape_rates = np.sum(np.array([[ (1 - self.nodes[l]) * link_weights[j,l] for j in range(self.N)] for l in range(self.N)]),axis=1)
-        particleInds = np.arange(self.N)[self.nodes == 1]
-        # Calculate random waiting times for the particles to escape to another site
-        escape_times = np.array([np.random.exponential(scale = 1. / (elem + 1e-30)) for elem in escape_rates])[particleInds]
+        dt, dE, l, le = update_network(N, nodes, tau, links, link_energies, Us, Vs)
 
-        # Identify the fastest particle to move
-        myInd = np.argmin(escape_times)
-        myTime = escape_times[myInd]
-        myInd = particleInds[myInd]
-        assert(self.nodes[myInd] == 1)
-        self.dt = myTime
-        self.time += self.dt
+        energy += dE
+        myTime += dt
 
-        # Choose which site the particle hops to
-        openInds = np.arange(self.N)[self.nodes == 0]
-        proposal_weights = (link_weights[myInd,:])[openInds]
-        if np.sum(proposal_weights) > 0:
-            proposal_weights /= np.sum(proposal_weights)
-            linkChoice = int(np.random.choice(np.arange(len(openInds)), p = proposal_weights))
-        else:
-            linkChoice = int(np.argmax(proposal_weights))
-        linkChoice = openInds[linkChoice]
+        links = l
+        link_energies = le
 
-        assert(self.nodes[linkChoice] == 0)
+        occAvg += old_nodes * dt
 
-        # Update the state and energy
-        self.nodes[myInd] = 0
-        self.nodes[linkChoice] = 1
-        self.energy += self.link_energies[myInd,linkChoice]
+    occAvg /= time_history[-1]
 
-        # Update the links since site myInd cannot facilitate, but linkChoice can
-        self.links -= self.Vs[:,myInd,:]
-        self.links += self.Vs[:,linkChoice,:]
+    return (node_history, energy_history, time_history, occAvg, myDis)
 
-        # Update the energy differences for links
-        for j in range(self.N):
-            for l in range(self.N):
-                self.link_energies[j,l] += self.Us[j,myInd] - self.Us[l,myInd]
-                self.link_energies[j,l] -= self.Us[j,linkChoice] - self.Us[l,linkChoice]
+@jit
+def update_network(N, nodes, tau, links, link_energies, Us, Vs):
+    """
+        Update scheme for the Monte Carlo.
+        (1) Compute the escape rates for each particle
+        (2) Randomly select a particle to escape and choose which link it takes.
+        (3) Update the stored link weights and such.
+    """
 
-        assert(np.sum(self.nodes) == self.partNum)
+    # compute the escape rates for each particle
+    link_weights = np.abs(links)**2 * bathDensity(link_energies, tau)
+    escape_rates = nodes * np.array([np.dot((1.-nodes), link_weights[j,:]) for j in range(N)])
+    particle_inds = np.arange(N)[nodes == 1]
+    np.random.seed(123)
+    escape_times = np.array([np.random.exponential(scale=1./(elem + 1e-30)) for elem in escape_rates])[particle_inds]
+
+    # identify the fastest particle
+    my_ind = np.argmin(escape_times)
+    my_wait = escape_times[my_ind]
+    my_ind = particle_inds[my_ind]
+
+    # choose a random link for the particle to hop along
+    open_inds = np.arange(N)[nodes == 0]
+    proposal_weights = (link_weights[my_ind,:])[open_inds]
+    proposal_weights /= np.sum(proposal_weights)
+    r = np.random.rand()
+    cumsum_weights = np.cumsum(proposal_weights)
+    link_choice = np.searchsorted(cumsum_weights, r, side="right")
+    link_choice = open_inds[link_choice]
+
+    # update the nodes and get the energy change
+    nodes[my_ind] = 0
+    nodes[link_choice] = 1
+    energy_change = link_energies[my_ind, link_choice]
+
+    # update the link weights
+    links -= Vs[:,my_ind,:]
+    links += Vs[:,link_choice,:]
+
+    # update the link energy differences
+    for j in range(N):
+        for l in range(N):
+            link_energies[j,l] += Us[j,my_ind] - Us[l,my_ind]
+            link_energies[j,l] -= Us[j,link_choice] - Us[l,link_choice]
+
+    return my_wait, energy_change, links, link_energies
 
 
 if __name__ == "__main__":
@@ -197,40 +194,20 @@ if __name__ == "__main__":
     if len(sys.argv) >= 6:
         config_str = str(sys.argv[5])
     else:
-        config_str = "N_{0:d}_h_{1:.2f}_tau_{2:.3f}".format(N,h,myTau)
+        config_str = "N_{0:d}_h_{1:.2f}_tau_{2:.3f}_jitted".format(N,h,myTau)
 
     print("N = {0:d}, h = {1:.2f}, tau = {2:.2f}".format(N,h,myTau))
 
-    myNet = Network(N, h, tau = myTau, partNum = myPartNum)
-    print("Constructed network")
+    np.random.seed(123)
+    myDis = np.random.uniform(low=-h, high=h, size=N)
 
-    # Saving the full configuration history, energies, and times
-    node_history = []
-    energy_history = np.zeros(numSteps)
-    time_history = np.zeros(numSteps)
-    occAvg = np.zeros(N)
-
-    for i in range(numSteps):
-        if (i % (numSteps // 20) == 0):
-            print(i)
-
-        energy_history[i] = myNet.energy
-        time_history[i] = myNet.time
-        node_history.append(''.join([str(int(elem)) for elem in myNet.nodes]))
-
-        oldNodes = np.copy(myNet.nodes)
-
-        myNet.update()
-
-        occAvg += oldNodes * myNet.dt
-
-    occAvg /= time_history[-1]
+    (node_history, energy_history, time_history, occAvg, myDis) = run_sim(N, h, partNum=myPartNum, tau=myTau, N_steps = numSteps, myDis=myDis)
 
     print("Final time: {0:.2f}".format(time_history[-1]))
 
     fn_prefix = "Results/"
 
-    np.savetxt(fn_prefix + "disorder_" + config_str + ".txt", myNet.dis)
+    np.savetxt(fn_prefix + "disorder_" + config_str + ".txt", myDis)
     np.savetxt(fn_prefix + "occupations_" + config_str + ".txt", occAvg)
     np.savetxt(fn_prefix + "times_" + config_str + ".txt", time_history)
     np.savetxt(fn_prefix + "energies_" + config_str + ".txt", energy_history)
