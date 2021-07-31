@@ -136,7 +136,6 @@ def update_network(N, nodes, tau, links, link_energies, Us, Vs):
     link_weights = np.abs(links)**2 * bathDensity(link_energies, tau)
     escape_rates = nodes * np.array([np.dot((1.-nodes), link_weights[j,:]) for j in range(N)])
     particle_inds = np.arange(N)[nodes == 1]
-    np.random.seed(123)
     escape_times = np.array([np.random.exponential(scale=1./(elem + 1e-30)) for elem in escape_rates])[particle_inds]
 
     # identify the fastest particle
